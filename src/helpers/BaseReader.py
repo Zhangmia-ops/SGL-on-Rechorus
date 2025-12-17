@@ -40,11 +40,28 @@ class BaseReader(object):
                 else:
                     self.residual_clicked_set[uid].add(iid)
 
+    #   def _read_data(self):
+    #     logging.info('Reading data from \"{}\", dataset = \"{}\" '.format(self.prefix, self.dataset))
+    #     self.data_df = dict()
+    #     for key in ['train', 'dev', 'test']:
+    #         self.data_df[key] = pd.read_csv(os.path.join(self.prefix, self.dataset, key + '.csv'), sep=self.sep).reset_index(drop=True).sort_values(by = ['user_id','time'])
+    #         self.data_df[key] = utils.eval_list_columns(self.data_df[key])
+
     def _read_data(self):
         logging.info('Reading data from \"{}\", dataset = \"{}\" '.format(self.prefix, self.dataset))
         self.data_df = dict()
         for key in ['train', 'dev', 'test']:
-            self.data_df[key] = pd.read_csv(os.path.join(self.prefix, self.dataset, key + '.csv'), sep=self.sep).reset_index(drop=True).sort_values(by = ['user_id','time'])
+            self.data_df[key] = pd.read_csv(
+                os.path.join(self.prefix, self.dataset, key + '.csv'), 
+                sep=self.sep
+            ).reset_index(drop=True).sort_values(by=['user_id','time'])
+            
+            # 转换 neg_items 列
+            if 'neg_items' in self.data_df[key].columns:
+                import ast
+                self.data_df[key]['neg_items'] = self.data_df[key]['neg_items'].apply(lambda x: ast.literal_eval(x))
+            
+            # 如果有其它 list 类型的列，也可以用 utils.eval_list_columns
             self.data_df[key] = utils.eval_list_columns(self.data_df[key])
 
         logging.info('Counting dataset statistics...')

@@ -18,7 +18,7 @@ from models.BaseModel import BaseModel
 class BaseRunner(object):
 	@staticmethod
 	def parse_runner_args(parser):
-		parser.add_argument('--epoch', type=int, default=200,
+		parser.add_argument('--epoch', type=int, default=10,
 							help='Number of epochs.')
 		parser.add_argument('--check_epoch', type=int, default=1,
 							help='Check some tensors every check_epoch.')

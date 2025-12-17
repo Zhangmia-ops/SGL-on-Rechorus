@@ -16,7 +16,8 @@ from models.context import *
 from models.context_seq import *
 from models.reranker import *
 from utils import utils
-
+import logging
+logging.basicConfig(level=logging.INFO)
 
 def parse_global_args(parser):
 	parser.add_argument('--gpu', type=str, default='0',
