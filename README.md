@@ -22,17 +22,19 @@ ReChorus2.0 是一个模块化、任务灵活的 PyTorch 推荐库，专为科�
 
 ## 运行指引
 本实验在`python3.8`环境下进行。
-1. 安装[Anaconda](https://docs.conda.io/en/latest/miniconda.html) with Python = 3.8.20
+1. 安装[Anaconda](https://docs.conda.io/en/latest/miniconda.html)
+   
+    Python版本：3.8.20
 2. 克隆储存库
    ```bash
     git clone https://github.com/Zhangmia-ops/SGL-on-Rechorus
     ```
-4. 安装所需组件
+3. 安装所需组件
    ```bash
     cd ReChorus
     pip install -r requirements.txt
     ```
-5. 使用内置数据集运行模型
+4. 使用内置数据集运行模型
    
    ```bash
     python src/main.py --model_name SGL --dataset MovieLens_1M/ml-1m --lr 1e-2  --epoch 30 --num_workers 0 --test_all 1 --emb_size 64 --l2 1e-5 --batch_size 2048 --n_layers 2
