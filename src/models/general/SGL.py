@@ -1,3 +1,4 @@
+# -*- coding: UTF-8 -*-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,198 +8,222 @@ import pandas as pd
 
 from models.BaseModel import GeneralModel
 
+
+class PaperLightGCN(nn.Module):
+    def __init__(self, user_num, item_num, emb_dim, n_layers):
+        super().__init__()
+        self.user_num = user_num
+        self.item_num = item_num
+        self.n_layers = n_layers
+
+        self.user_emb = nn.Embedding(user_num, emb_dim)
+        self.item_emb = nn.Embedding(item_num, emb_dim)
+
+        nn.init.normal_(self.user_emb.weight, std=0.2)
+        nn.init.normal_(self.item_emb.weight, std=0.2)
+
+    def forward(self, adj):
+        ego = torch.cat([self.user_emb.weight, self.item_emb.weight], dim=0)
+        embs = [ego]
+
+        for _ in range(self.n_layers):
+            ego = torch.sparse.mm(adj, ego)
+            embs.append(ego)
+
+        out = torch.mean(torch.stack(embs, dim=1), dim=1)
+        return torch.split(out, [self.user_num, self.item_num])
+
+
+# ============================================================================
+# SGL Model
+# ============================================================================
 class SGL(GeneralModel):
     reader = 'BaseReader'
     runner = 'BaseRunner'
-    # 将关键参数加入日志
-    extra_log_args = ['emb_size', 'n_layers', 'ssl_temp', 'ssl_reg', 'ssl_ratio']
+    extra_log_args = ['emb_size', 'n_layers', 'ssl_temp', 'ssl_reg', 'ssl_ratio', 'aug_type']
 
     @staticmethod
     def parse_model_args(parser):
         parser.add_argument('--emb_size', type=int, default=64)
         parser.add_argument('--n_layers', type=int, default=2)
-        parser.add_argument('--keep_prob', type=float, default=0.6)
-        
+
         # SSL args
-        parser.add_argument('--ssl_temp', type=float, default=0.2, help='Temperature for contrastive loss')
-        parser.add_argument('--ssl_reg', type=float, default=1e-5, help='Weight for SSL loss')
-        parser.add_argument('--aug_type', type=int, default=1, help='1=edge drop, 2=node drop, 3=rw')
-        parser.add_argument('--ssl_ratio', type=float, default=0, help='Ratio for augmentation dropout')
-        
+        parser.add_argument('--ssl_temp', type=float, default=0.2)
+        parser.add_argument('--ssl_reg', type=float, default=1e-5)
+        parser.add_argument('--ssl_ratio', type=float, default=0.1)
+        parser.add_argument('--aug_type', type=int, default=1,
+                            help='1=edge drop, 2=node drop, 3=random walk')
+
         return GeneralModel.parse_model_args(parser)
 
+    # ------------------------------------------------------------------------
+    # Init
+    # ------------------------------------------------------------------------
     def __init__(self, args, corpus):
-        GeneralModel.__init__(self, args, corpus)
-        
+        super().__init__(args, corpus)
+
         self.emb_size = args.emb_size
         self.n_layers = args.n_layers
         self.ssl_temp = args.ssl_temp
         self.ssl_reg = args.ssl_reg
-        self.aug_type = args.aug_type
         self.ssl_ratio = args.ssl_ratio
-        
-        # 记录 L2 参数供参考，但正则化交由 BaseRunner 的 Optimizer 处理
-        self.l2 = args.l2 
+        self.aug_type = args.aug_type
 
-        # 1. 初始化 Embedding
-        self._init_weights()
-        
-        # 2. 构建图
-        self.graph = None
-        if hasattr(corpus, 'train_clicked_set'):
-            train_data = corpus.train_clicked_set
-        elif hasattr(corpus, 'train'):
-            train_data = corpus.train
-        else:
-            train_data = corpus
-        self.prepare_graph(train_data)
+        # Encoder
+        self.encoder = PaperLightGCN(
+            self.user_num, self.item_num,
+            self.emb_size, self.n_layers
+        ).to(self.device)
 
-    def _init_weights(self):
-        self.u_embeddings = nn.Embedding(self.user_num, self.emb_size)
-        self.i_embeddings = nn.Embedding(self.item_num, self.emb_size)
-        nn.init.xavier_normal_(self.u_embeddings.weight)
-        nn.init.xavier_normal_(self.i_embeddings.weight)
+        # Graph
+        self.graph = self._build_graph(corpus)
+        self.graph = self.graph.coalesce().to(self.device)
 
-    def prepare_graph(self, train_data):
-        if isinstance(train_data, dict):
-            users, items = [], []
-            for u, i_list in train_data.items():
-                users.extend([u] * len(i_list))
-                items.extend(i_list)
-            df = pd.DataFrame({'user_id': users, 'item_id': items})
-        elif isinstance(train_data, list):
-            df = pd.DataFrame(train_data)
-        else:
-            df = train_data
+    # ------------------------------------------------------------------------
+    # Graph construction
+    # ------------------------------------------------------------------------
+    def _build_graph(self, corpus):
+        train_data = corpus.train_clicked_set
+        users, items = [], []
 
-        user_np = df['user_id'].values
-        item_np = df['item_id'].values
-        n_users, n_items = self.user_num, self.item_num
+        for u, ilist in train_data.items():
+            users.extend([u] * len(ilist))
+            items.extend(ilist)
 
-        ratings = np.ones_like(user_np, dtype=np.float32)
+        df = pd.DataFrame({'user': users, 'item': items})
+        u = df['user'].values
+        i = df['item'].values
+
+        n_nodes = self.user_num + self.item_num
         mat = sp.csr_matrix(
-            (ratings, (user_np, item_np + n_users)), 
-            shape=(n_users + n_items, n_users + n_items)
+            (np.ones_like(u, dtype=np.float32), (u, i + self.user_num)),
+            shape=(n_nodes, n_nodes)
         )
-        
+
         adj = mat + mat.T
         rowsum = np.array(adj.sum(1))
         d_inv = np.power(rowsum, -0.5).flatten()
         d_inv[np.isinf(d_inv)] = 0.
         d_mat = sp.diags(d_inv)
-        
-        norm_adj = d_mat.dot(adj).dot(d_mat)
-        
-        self.graph = self._convert_sp_mat_to_sp_tensor(norm_adj)
-        self.graph = self.graph.coalesce().to(self.device)
 
-    def _convert_sp_mat_to_sp_tensor(self, X):
-        coo = X.tocoo()
+        norm_adj = d_mat.dot(adj).dot(d_mat)
+        return self._sp_to_tensor(norm_adj)
+
+    def _sp_to_tensor(self, mat):
+        coo = mat.tocoo()
         indices = torch.LongTensor([coo.row, coo.col])
         values = torch.FloatTensor(coo.data)
         return torch.sparse.FloatTensor(indices, values, coo.shape)
 
-    def _propagate(self, graph):
-        all_emb = torch.cat([self.u_embeddings.weight, self.i_embeddings.weight], dim=0)
-        embs = [all_emb]
+    # ------------------------------------------------------------------------
+    # Graph augmentations
+    # ------------------------------------------------------------------------
+    def _edge_dropout(self):
+        g = self.graph
+        idx = g.indices()
+        val = g.values()
 
+        mask = torch.rand(len(val), device=val.device) > self.ssl_ratio
+        return torch.sparse.FloatTensor(
+            idx[:, mask], val[mask], g.shape
+        ).coalesce()
+
+    def _node_dropout(self):
+        g = self.graph
+        idx = g.indices()
+        val = g.values()
+
+        node_mask = torch.rand(self.user_num + self.item_num,
+                               device=val.device) > self.ssl_ratio
+        keep = node_mask[idx[0]] & node_mask[idx[1]]
+
+        return torch.sparse.FloatTensor(
+            idx[:, keep], val[keep], g.shape
+        ).coalesce()
+
+    def _rw_subgraphs(self):
+        v1, v2 = [], []
         for _ in range(self.n_layers):
-            all_emb = torch.sparse.mm(graph, all_emb)
-            embs.append(all_emb)
-        
-        embs = torch.stack(embs, dim=1)
-        final_emb = torch.mean(embs, dim=1)
-        
-        users, items = torch.split(final_emb, [self.user_num, self.item_num])
-        return users, items
+            v1.append(self._edge_dropout())
+            v2.append(self._edge_dropout())
+        return v1, v2
 
-    def _graph_dropout(self, graph, keep_prob):
-        size = graph.size()
-        index = graph.indices().t()
-        values = graph.values()
+    def _rw_forward(self, views):
+        ego = torch.cat([
+            self.encoder.user_emb.weight,
+            self.encoder.item_emb.weight
+        ], dim=0)
 
-        random_tensor = torch.rand(values.size(), device=values.device) + keep_prob
-        mask = random_tensor.floor().bool()
-        
-        index = index[mask]
-        values = values[mask] / keep_prob
-        return torch.sparse.FloatTensor(index.t(), values, size)
+        embs = [ego]
+        for l in range(self.n_layers):
+            ego = torch.sparse.mm(views[l], ego)
+            embs.append(ego)
 
-    def _calc_ssl_loss(self, view1_emb, view2_emb, idx):
-        view1 = F.normalize(view1_emb[idx], dim=1)
-        view2 = F.normalize(view2_emb[idx], dim=1)
-        
-        pos_score = (view1 * view2).sum(dim=1)
-        ttl_score = torch.matmul(view1, view2.t())
-        
-        pos_score = torch.exp(pos_score / self.ssl_temp)
-        ttl_score = torch.sum(torch.exp(ttl_score / self.ssl_temp), dim=1)
-        
-        loss = -torch.log(pos_score / ttl_score).mean()
-        return loss
+        out = torch.mean(torch.stack(embs, dim=1), dim=1)
+        return torch.split(out, [self.user_num, self.item_num])
 
-    # ----------------------------------------------------------------------------
-    # FORWARD
-    # ----------------------------------------------------------------------------
+    # ------------------------------------------------------------------------
+    # SSL loss (paper-level)
+    # ------------------------------------------------------------------------
+    def _ssl_loss(self, emb1, emb2, idx):
+        z1 = F.normalize(emb1[idx], dim=1)
+        z2 = F.normalize(emb2[idx], dim=1)
+
+        logits = torch.matmul(z1, z2.t()) / self.ssl_temp
+        labels = torch.arange(len(idx), device=idx.device)
+        return F.cross_entropy(logits, labels)
+
+    # ------------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------------
     def forward(self, feed_dict):
-        u_all, i_all = self._propagate(self.graph)
-        
-        u_ids = feed_dict['user_id']
-        i_ids = feed_dict['item_id']
-        
-        u_emb = u_all[u_ids]
-        i_emb = i_all[i_ids]
-        
-        prediction = (u_emb[:, None, :] * i_emb).sum(dim=-1)
-        
-        out_dict = {'prediction': prediction.view(feed_dict['batch_size'], -1)}
+        u_ids = feed_dict['user_id'].long()
+        i_ids = feed_dict['item_id'].long()
 
-        # 训练时计算 SSL Loss
-        if self.training and self.ssl_reg > 1e-6:
-            # === SSL Loss ===
-            # 生成增强视图
-            g1 = self._graph_dropout(self.graph, 1 - self.ssl_ratio)
-            g2 = self._graph_dropout(self.graph, 1 - self.ssl_ratio)
+        u_all, i_all = self.encoder(self.graph)
+        pred = (u_all[u_ids][:, None, :] * i_all[i_ids]).sum(-1)
+
+        out = {'prediction': pred.view(feed_dict['batch_size'], -1)}
+
+        # SSL
+        if self.training and self.ssl_reg > 0:
+            if self.aug_type == 3:
+                v1, v2 = self._rw_subgraphs()
+                u1, i1 = self._rw_forward(v1)
+                u2, i2 = self._rw_forward(v2)
+            else:
+                g1 = self._edge_dropout() if self.aug_type == 1 else self._node_dropout()
+                g2 = self._edge_dropout() if self.aug_type == 1 else self._node_dropout()
+                u1, i1 = self.encoder(g1)
+                u2, i2 = self.encoder(g2)
+
+            all1 = torch.cat([u1, i1], dim=0)
+            all2 = torch.cat([u2, i2], dim=0)
             
-            user_view1, item_view1 = self._propagate(g1)
-            user_view2, item_view2 = self._propagate(g2)
-            
-            # User SSL
-            ssl_user = self._calc_ssl_loss(
-                torch.cat([user_view1, item_view1], dim=0),
-                torch.cat([user_view2, item_view2], dim=0),
-                u_ids
-            )
-            
-            # Item SSL (涉及当前 batch 的所有 item，包括负样本)
-            flat_items = i_ids.flatten().unique()
-            ssl_item = self._calc_ssl_loss(
-                torch.cat([user_view1, item_view1], dim=0),
-                torch.cat([user_view2, item_view2], dim=0),
-                flat_items + self.user_num
-            )
-            
-            out_dict['ssl_loss'] = ssl_user + ssl_item
+            # users: [B]
+            user_idx = u_ids
+
+            # items: [B, 2] → [2B]
+            item_idx = i_ids.view(-1) + self.user_num
+
+            idx = torch.cat([user_idx, item_idx]).unique()
+            ssl = self._ssl_loss(all1, all2, idx)
+
+
+            out['ssl_loss'] = ssl * self.ssl_reg
         else:
-            out_dict['ssl_loss'] = torch.tensor(0.0, device=self.device)
+            out['ssl_loss'] = torch.tensor(0.0, device=self.device)
 
-        return out_dict
+        return out
 
-    # ----------------------------------------------------------------------------
-    # LOSS
-    # ----------------------------------------------------------------------------
+    # ------------------------------------------------------------------------
+    # Loss
+    # ------------------------------------------------------------------------
     def loss(self, out_dict):
-        # 1. BPR Loss (调用父类，基于 'prediction' 计算)
-        bpr_loss = super().loss(out_dict)
+        bpr = super().loss(out_dict)
+        return bpr + out_dict['ssl_loss']
 
-        # 2. SSL Loss
-        ssl_loss = out_dict['ssl_loss'] * self.ssl_reg
-        
-        # 3. L2 Loss 不需要手动加！ReChorus 的 BaseRunner 会在 optimizer 里做 weight_decay
-        
-        return bpr_loss + ssl_loss
 
 class SGLImpression(SGL):
     reader = 'ImpressionReader'
     runner = 'ImpressionRunner'
-
