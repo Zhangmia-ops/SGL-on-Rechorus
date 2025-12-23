@@ -37,8 +37,8 @@ ReChorus2.0 是一个模块化、任务灵活的 PyTorch 推荐库，专为科�
 4. 使用内置数据集运行模型
    
    ```bash
-    python src/main.py --model_name SGL --dataset MovieLens_1M/ml-1m --lr 1e-2  --epoch 30 --num_workers 0 --test_all 1 --emb_size 64 --l2 1e-5 --batch_size 2048 --n_layers 2
+    python src/main.py --model_name SGL --dataset MovieLens_1M/ML_1MTOPK --lr 1e-2  --epoch 30 --num_workers 0  --emb_size 64 --l2 1e-5 --batch_size 2048 --n_layers 2 --ssl_temp 0.2 --ssl_ratio 0.2 --ssl_reg 0.05
    ```
-   可以更改参数复现报告中各项实验的SGL表现，
+   可以更改数据集、超参数等复现报告中各项实验的SGL表现。
 
 
